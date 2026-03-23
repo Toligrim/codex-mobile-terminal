@@ -13,6 +13,8 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const ALLOW_LOCALHOST = process.env.ALLOW_LOCALHOST !== 'false';
 const UPLOAD_MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 25 * 1024 * 1024);
 const UPLOAD_DIR = path.join(__dirname, '..', 'files', 'tmp');
+const AUTH_FAILURE_TTL_MS = Number(process.env.AUTH_FAILURE_TTL_MS || 30 * 60 * 1000);
+const AUTH_FAILURE_SWEEP_INTERVAL_MS = Number(process.env.AUTH_FAILURE_SWEEP_INTERVAL_MS || 5 * 60 * 1000);
 const ALLOWED_SUBNETS = (process.env.ALLOWED_SUBNETS || '')
   .split(',')
   .map((item) => item.trim())
@@ -50,9 +52,21 @@ function parseCookies(cookieHeader) {
     if (eqIndex === -1) continue;
     const key = pair.slice(0, eqIndex).trim();
     const value = pair.slice(eqIndex + 1).trim();
-    result[key] = decodeURIComponent(value);
+    try {
+      result[key] = decodeURIComponent(value);
+    } catch (_err) {
+      result[key] = value;
+    }
   }
   return result;
+}
+
+function safeParseUrl(urlText, baseUrl) {
+  try {
+    return new URL(urlText || '/', baseUrl);
+  } catch (_err) {
+    return null;
+  }
 }
 
 function parseCidr(cidrText) {
@@ -107,10 +121,11 @@ function isIpAllowed(address) {
 }
 
 function getFailureState(ip) {
-  const state = authFailures.get(ip) || { count: 0, blockedUntil: 0 };
-  if (state.blockedUntil < Date.now() && state.count === 0) {
+  const state = authFailures.get(ip) || { count: 0, blockedUntil: 0, expiresAt: 0 };
+  const now = Date.now();
+  if (state.expiresAt <= now && state.blockedUntil <= now) {
     authFailures.delete(ip);
-    return { count: 0, blockedUntil: 0 };
+    return { count: 0, blockedUntil: 0, expiresAt: 0 };
   }
   return state;
 }
@@ -129,7 +144,11 @@ function registerAuthFailure(ip) {
     blockedUntil = Date.now() + blockMs;
   }
 
-  authFailures.set(ip, { count: nextCount, blockedUntil });
+  authFailures.set(ip, {
+    count: nextCount,
+    blockedUntil,
+    expiresAt: Date.now() + AUTH_FAILURE_TTL_MS
+  });
 }
 
 function authSlowdownMs(ip) {
@@ -181,7 +200,8 @@ function extractTokenFromRequestLike(requestLike, options = {}) {
 
   const host = requestLike.headers?.host || 'localhost';
   const protocol = requestLike.headers?.['x-forwarded-proto'] || 'http';
-  const url = new URL(requestLike.url || '/', `${protocol}://${host}`);
+  const url = safeParseUrl(requestLike.url, `${protocol}://${host}`);
+  if (!url) return '';
   return (url.searchParams.get('token') || '').trim();
 }
 
@@ -354,7 +374,13 @@ app.post(
   '/api/upload',
   express.raw({ type: 'application/octet-stream', limit: UPLOAD_MAX_BYTES }),
   async (req, res) => {
-    const rawName = decodeURIComponent(String(req.headers['x-file-name'] || ''));
+    let rawName = '';
+    try {
+      rawName = decodeURIComponent(String(req.headers['x-file-name'] || ''));
+    } catch (_err) {
+      res.status(400).json({ error: 'invalid_filename' });
+      return;
+    }
     const safeName = sanitizeFilename(rawName);
     if (!safeName) {
       res.status(400).json({ error: 'invalid_filename' });
@@ -397,8 +423,13 @@ app.get('/api/bootstrap', (_req, res) => {
 
 server.on('upgrade', (req, socket, head) => {
   const host = req.headers.host || 'localhost';
-  const url = new URL(req.url || '/', `http://${host}`);
+  const url = safeParseUrl(req.url, `http://${host}`);
   const ip = normalizeIp(req.socket.remoteAddress);
+
+  if (!url) {
+    writeUpgradeError(socket, 400, 'Bad Request');
+    return;
+  }
 
   if (url.pathname !== '/ws') {
     writeUpgradeError(socket, 404, 'Not Found');
@@ -512,6 +543,15 @@ function shutdown() {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, state] of authFailures.entries()) {
+    if ((state.expiresAt || 0) <= now && state.blockedUntil <= now) {
+      authFailures.delete(ip);
+    }
+  }
+}, AUTH_FAILURE_SWEEP_INTERVAL_MS).unref();
 
 server.listen(PORT, '0.0.0.0', () => {
   // eslint-disable-next-line no-console

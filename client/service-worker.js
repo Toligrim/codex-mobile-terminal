@@ -1,4 +1,4 @@
-const CACHE_NAME = 'codex-terminal-v2';
+const CACHE_NAME = 'codex-terminal-v3';
 const CORE_ASSETS = [
   '/',
   '/index.html',
@@ -66,6 +66,11 @@ self.addEventListener('fetch', (event) => {
   }
 
   if (!isSameOrigin) {
+    return;
+  }
+
+  if (url.pathname === '/app.js' || url.pathname === '/styles.css') {
+    event.respondWith(networkFirst(event.request));
     return;
   }
 
