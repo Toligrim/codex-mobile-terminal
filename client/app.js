@@ -4,18 +4,22 @@ const terminalWrapEl = document.getElementById('terminal-wrap');
 const toolbarEl = document.querySelector('.toolbar');
 const topbarEl = document.getElementById('topbar');
 const ctrlButton = document.querySelector('[data-action="ctrl"]');
+const modeToggleButton = document.getElementById('mode-toggle');
 const toolbarToggleButton = document.getElementById('toolbar-toggle');
 const uploadButton = document.getElementById('upload');
 const logoutButton = document.getElementById('logout');
 const fileInputEl = document.getElementById('file-input');
 const appEl = document.getElementById('app');
 
-const fontSizes = [13, 15, 17];
+const fontSizes = [10, 12, 14, 16, 18, 20];
 const reconnectBaseMs = 800;
 const reconnectMaxMs = 10000;
 const STORAGE_BOOTSTRAP_TOKEN = 'bootstrap_token';
+const STORAGE_FONT_SIZE = 'terminal_font_size';
+const MIN_FONT_SIZE = 10;
+const MAX_FONT_SIZE = 24;
 
-let fontIndex = 1;
+let fontIndex = 2;
 let ctrlArmed = false;
 let socket = null;
 let socketCleanup = null;
@@ -26,12 +30,33 @@ let reconnectLocked = false;
 let connectedOnce = false;
 let isConnecting = false;
 let toolbarCollapsed = false;
+let inputMode = false;
+let pinchState = {
+  active: false,
+  startDistance: 0,
+  startSize: 14
+};
+
+function getSavedFontSize() {
+  const saved = Number(localStorage.getItem(STORAGE_FONT_SIZE));
+  if (!Number.isFinite(saved)) {
+    return fontSizes[fontIndex];
+  }
+  return Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, Math.round(saved)));
+}
+
+function setTerminalFontSize(nextSize) {
+  const safeSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, Math.round(nextSize)));
+  term.options.fontSize = safeSize;
+  localStorage.setItem(STORAGE_FONT_SIZE, String(safeSize));
+  fitAndResize();
+}
 
 const term = new Terminal({
   cursorBlink: true,
   convertEol: true,
   fontFamily: "Menlo, Monaco, Consolas, 'SF Mono', monospace",
-  fontSize: fontSizes[fontIndex],
+  fontSize: getSavedFontSize(),
   lineHeight: 1.24,
   cursorStyle: 'block',
   theme: {
@@ -133,7 +158,12 @@ async function ensureAuthenticated() {
   return false;
 }
 
-function scheduleFocus(delayMs = 0) {
+function scheduleFocus(delayMs = 0, options = {}) {
+  const { force = false } = options;
+  if (!inputMode && !force) {
+    return;
+  }
+
   clearTimeout(focusTimer);
   focusTimer = setTimeout(() => {
     if (document.visibilityState === 'visible') {
@@ -158,8 +188,22 @@ function setToolbarCollapsed(nextState) {
   toolbarCollapsed = nextState;
   appEl.classList.toggle('toolbar-collapsed', toolbarCollapsed);
   toolbarToggleButton.textContent = toolbarCollapsed ? 'Keys' : 'Hide';
-  scheduleFocus(20);
+  scheduleFocus(20, { force: true });
   setTimeout(updateViewportHeight, 20);
+}
+
+function setInputMode(nextState) {
+  inputMode = nextState;
+  modeToggleButton.textContent = inputMode ? 'Mode: Input' : 'Mode: Scroll';
+  modeToggleButton.classList.toggle('active', inputMode);
+
+  if (!inputMode && typeof term.blur === 'function') {
+    term.blur();
+  }
+
+  if (inputMode) {
+    scheduleFocus(20, { force: true });
+  }
 }
 
 function fitAndResize() {
@@ -167,6 +211,12 @@ function fitAndResize() {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   }
+}
+
+function touchDistance(touchA, touchB) {
+  const dx = touchA.clientX - touchB.clientX;
+  const dy = touchA.clientY - touchB.clientY;
+  return Math.hypot(dx, dy);
 }
 
 function updateViewportHeight() {
@@ -492,6 +542,12 @@ toolbarEl.addEventListener('click', async (event) => {
 
   const { action } = button.dataset;
   vibrate(10);
+
+  const inputActions = ['ctrl', 'esc', 'tab', 'up', 'down', 'left', 'right', 'paste'];
+  if (inputActions.includes(action) && !inputMode) {
+    setInputMode(true);
+  }
+
   scheduleFocus(0);
 
   if (action === 'ctrl') {
@@ -509,9 +565,9 @@ toolbarEl.addEventListener('click', async (event) => {
   if (action === 'paste') return handlePaste();
 
   if (action === 'font') {
-    fontIndex = (fontIndex + 1) % fontSizes.length;
-    term.options.fontSize = fontSizes[fontIndex];
-    fitAndResize();
+    const current = Number(term.options.fontSize) || fontSizes[fontIndex];
+    const next = fontSizes.find((size) => size > current) || fontSizes[0];
+    setTerminalFontSize(next);
     return;
   }
 
@@ -543,6 +599,11 @@ toolbarEl.addEventListener('click', async (event) => {
 logoutButton.addEventListener('click', () => {
   vibrate(12);
   handleLogout();
+});
+
+modeToggleButton.addEventListener('click', () => {
+  vibrate(8);
+  setInputMode(!inputMode);
 });
 
 toolbarToggleButton.addEventListener('click', () => {
@@ -581,9 +642,70 @@ document.addEventListener(
 );
 
 for (const el of [terminalWrapEl, topbarEl]) {
-  el.addEventListener('pointerdown', () => scheduleFocus(0));
-  el.addEventListener('touchstart', () => scheduleFocus(0), { passive: true });
+  if (el === topbarEl) {
+    el.addEventListener('pointerdown', () => scheduleFocus(0));
+    el.addEventListener('touchstart', () => scheduleFocus(0), { passive: true });
+  }
 }
+
+terminalWrapEl.addEventListener(
+  'touchstart',
+  (event) => {
+    if (event.touches.length !== 2) {
+      return;
+    }
+
+    const [a, b] = event.touches;
+    pinchState.active = true;
+    pinchState.startDistance = touchDistance(a, b);
+    pinchState.startSize = Number(term.options.fontSize) || 14;
+  },
+  { passive: true }
+);
+
+terminalWrapEl.addEventListener(
+  'touchmove',
+  (event) => {
+    if (!pinchState.active || event.touches.length !== 2) {
+      return;
+    }
+
+    const [a, b] = event.touches;
+    const currentDistance = touchDistance(a, b);
+    if (pinchState.startDistance < 8) {
+      return;
+    }
+
+    const ratio = currentDistance / pinchState.startDistance;
+    const nextSize = pinchState.startSize * ratio;
+    setTerminalFontSize(nextSize);
+    event.preventDefault();
+  },
+  { passive: false }
+);
+
+terminalWrapEl.addEventListener(
+  'touchend',
+  (event) => {
+    const endedPinch = pinchState.active && event.touches.length < 2;
+    if (event.touches.length < 2) {
+      pinchState.active = false;
+    }
+
+    if (endedPinch) {
+      return;
+    }
+
+    if (!inputMode) {
+      return;
+    }
+    if (!event.target.closest('.xterm-viewport')) {
+      return;
+    }
+    scheduleFocus(0);
+  },
+  { passive: true }
+);
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
@@ -611,6 +733,7 @@ if ('serviceWorker' in navigator) {
   }
 
   updateViewportHeight();
+  setInputMode(false);
   toolbarToggleButton.textContent = 'Hide';
   connect();
   scheduleFocus(20);
