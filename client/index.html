@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="CodexTerm" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#111318" />
+    <title>Codex Terminal</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="/icons/icon-192.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.svg" />
+    <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar" id="topbar">
+        <div class="session">Session: <strong>main</strong></div>
+        <div class="topbar-right">
+          <div id="status" class="status offline">Offline</div>
+          <button id="toolbar-toggle" class="toggle-btn" type="button">Keys</button>
+          <button id="upload" class="upload-btn" type="button">Upload</button>
+          <button id="logout" class="logout-btn" type="button">Logout</button>
+        </div>
+      </header>
+      <input id="file-input" type="file" hidden multiple />
+
+      <main id="terminal-wrap">
+        <div id="terminal"></div>
+      </main>
+
+      <footer class="toolbar" aria-label="Terminal controls">
+        <div class="toolbar-col toolbar-mods">
+          <button data-action="ctrl" class="key">Ctrl</button>
+          <button data-action="esc" class="key">Esc</button>
+          <button data-action="tab" class="key">Tab</button>
+        </div>
+
+        <div class="toolbar-col arrow-pad" aria-label="Arrow keys">
+          <span class="arrow-gap"></span>
+          <button data-action="up" class="key">↑</button>
+          <span class="arrow-gap"></span>
+          <button data-action="left" class="key">←</button>
+          <button data-action="down" class="key">↓</button>
+          <button data-action="right" class="key">→</button>
+        </div>
+
+        <div class="toolbar-col toolbar-actions">
+          <button data-action="paste" class="key">Paste</button>
+          <button data-action="font" class="key">Font</button>
+          <button data-action="tmux" class="key">Tmux</button>
+          <button data-action="reset" class="key">Reset</button>
+        </div>
+      </footer>
+    </div>
+
+    <script src="/vendor/xterm/lib/xterm.js"></script>
+    <script src="/vendor/xterm-addon-fit/lib/addon-fit.js"></script>
+    <script src="/vendor/xterm-addon-web-links/lib/addon-web-links.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
