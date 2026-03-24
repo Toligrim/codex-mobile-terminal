@@ -256,6 +256,12 @@ function authMiddleware(req, res, next) {
   }
 
   if (!isAuthenticated(req, { allowQueryToken: allowBootstrapToken })) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[auth] unauthorized path=${req.path} ip=${ip} hasCookie=${Boolean(parseCookies(req.headers.cookie).auth_token)} hasAuthHeader=${Boolean(
+        req.headers.authorization
+      )} hasQueryToken=${Boolean((req.query?.token || '').trim())}`
+    );
     registerAuthFailure(ip);
     const delayMs = authSlowdownMs(ip);
     setTimeout(() => {
@@ -356,6 +362,94 @@ function sanitizeFilename(inputName) {
   return safe.slice(0, 120);
 }
 
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function analyzeGestureLog(logs) {
+  const safeLogs = Array.isArray(logs) ? logs : [];
+  const summary = {
+    events: safeLogs.length,
+    durationMs: 0,
+    maxBaseY: 0,
+    maxViewportY: 0,
+    viewportMoves: 0,
+    viewportJumpsWithoutTermMove: 0,
+    arbiterScrollEvents: 0,
+    nativeTouchScrollEvents: 0,
+    scrollGestures: 0,
+    status: 'unknown'
+  };
+
+  if (safeLogs.length === 0) {
+    summary.status = 'empty_log';
+    return summary;
+  }
+
+  const firstTs = toFiniteNumber(safeLogs[0]?.t);
+  const lastTs = toFiniteNumber(safeLogs[safeLogs.length - 1]?.t);
+  if (firstTs !== null && lastTs !== null && lastTs >= firstTs) {
+    summary.durationMs = Math.round(lastTs - firstTs);
+  }
+
+  let prevSnapshot = null;
+  for (const event of safeLogs) {
+    if (event?.type === 'gesture' && event?.to === 'scroll') {
+      summary.scrollGestures += 1;
+    }
+    if (event?.type === 'viewport' && event?.source === 'touchmove_arbiter') {
+      summary.arbiterScrollEvents += 1;
+    }
+    if (event?.type === 'viewport' && event?.source === 'touchmove_scroll') {
+      summary.nativeTouchScrollEvents += 1;
+    }
+
+    const snapshot = {
+      vvTop: toFiniteNumber(event?.vvTop),
+      vvH: toFiniteNumber(event?.vvH),
+      xtermViewportScrollTop: toFiniteNumber(event?.xtermViewportScrollTop),
+      termViewportY: toFiniteNumber(event?.termViewportY),
+      termBaseY: toFiniteNumber(event?.termBaseY)
+    };
+
+    if (snapshot.termBaseY !== null) {
+      summary.maxBaseY = Math.max(summary.maxBaseY, snapshot.termBaseY);
+    }
+    if (snapshot.termViewportY !== null) {
+      summary.maxViewportY = Math.max(summary.maxViewportY, snapshot.termViewportY);
+    }
+
+    if (prevSnapshot && snapshot.termViewportY !== null && prevSnapshot.termViewportY !== null) {
+      const termMoved = snapshot.termViewportY !== prevSnapshot.termViewportY;
+      if (termMoved) {
+        summary.viewportMoves += 1;
+      } else {
+        const visualChanged =
+          snapshot.vvTop !== prevSnapshot.vvTop || snapshot.vvH !== prevSnapshot.vvH;
+        const nativeScrollChanged = snapshot.xtermViewportScrollTop !== prevSnapshot.xtermViewportScrollTop;
+        if (visualChanged && !nativeScrollChanged) {
+          summary.viewportJumpsWithoutTermMove += 1;
+        }
+      }
+    }
+
+    prevSnapshot = snapshot;
+  }
+
+  if (summary.maxBaseY <= 0) {
+    summary.status = 'no_scrollback';
+  } else if (summary.viewportMoves > 0) {
+    summary.status = 'term_scroll_detected';
+  } else if (summary.arbiterScrollEvents > 0 || summary.nativeTouchScrollEvents > 0) {
+    summary.status = 'scroll_input_seen_no_term_move';
+  } else {
+    summary.status = 'no_scroll_input_detected';
+  }
+
+  return summary;
+}
+
 app.use(setSecurityHeaders);
 
 app.post('/api/logout', (req, res) => {
@@ -408,6 +502,36 @@ app.post(
     }
   }
 );
+
+app.post('/api/debug-log', express.json({ limit: '1mb' }), async (req, res) => {
+  const logs = Array.isArray(req.body) ? req.body : req.body?.logs;
+  if (!Array.isArray(logs)) {
+    res.status(400).json({ error: 'invalid_payload' });
+    return;
+  }
+
+  const summary = analyzeGestureLog(logs);
+  const targetName = `${Date.now()}-gesture-debug.json`;
+  const targetPath = path.join(UPLOAD_DIR, targetName);
+  const doc = {
+    uploadedAt: new Date().toISOString(),
+    summary,
+    meta: req.body?.meta || {},
+    logs
+  };
+
+  try {
+    await fs.promises.writeFile(targetPath, JSON.stringify(doc, null, 2), { flag: 'wx' });
+    res.json({
+      ok: true,
+      fileName: targetName,
+      relativePath: path.posix.join('files', 'tmp', targetName),
+      summary
+    });
+  } catch (_err) {
+    res.status(500).json({ error: 'upload_failed' });
+  }
+});
 app.use(express.static(path.join(__dirname, '..', 'client')));
 app.use('/vendor/xterm', express.static(path.join(__dirname, '..', 'node_modules', '@xterm', 'xterm')));
 app.use('/vendor/xterm-addon-fit', express.static(path.join(__dirname, '..', 'node_modules', '@xterm', 'addon-fit')));
@@ -425,18 +549,34 @@ server.on('upgrade', (req, socket, head) => {
   const host = req.headers.host || 'localhost';
   const url = safeParseUrl(req.url, `http://${host}`);
   const ip = normalizeIp(req.socket.remoteAddress);
+  const cookieToken = parseCookies(req.headers.cookie).auth_token;
+  const authHeader = req.headers.authorization || '';
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
 
   if (!url) {
+    // eslint-disable-next-line no-console
+    console.warn(`[ws-upgrade] bad_url ip=${ip}`);
     writeUpgradeError(socket, 400, 'Bad Request');
     return;
   }
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[ws-upgrade] incoming ip=${ip} path=${url.pathname} hasCookie=${Boolean(cookieToken)} hasQueryToken=${Boolean(
+      (url.searchParams.get('token') || '').trim()
+    )} hasAuthHeader=${Boolean(bearerMatch)}`
+  );
+
   if (url.pathname !== '/ws') {
+    // eslint-disable-next-line no-console
+    console.warn(`[ws-upgrade] not_found ip=${ip} path=${url.pathname}`);
     writeUpgradeError(socket, 404, 'Not Found');
     return;
   }
 
   if (!isIpAllowed(ip)) {
+    // eslint-disable-next-line no-console
+    console.warn(`[ws-upgrade] forbidden_ip ip=${ip}`);
     writeUpgradeError(socket, 403, 'Forbidden');
     return;
   }
@@ -449,8 +589,14 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  // WebSocket upgrades intentionally do not accept ?token bootstrap auth.
-  if (!isAuthenticated(req, { allowQueryToken: false })) {
+  // iOS/Safari can intermittently drop auth cookie on WS upgrade; allow bootstrap token query as fallback.
+  if (!isAuthenticated(req, { allowQueryToken: true })) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[ws-upgrade] unauthorized ip=${ip} hasCookie=${Boolean(parseCookies(req.headers.cookie).auth_token)} hasAuthHeader=${Boolean(
+        req.headers.authorization
+      )} hasQueryToken=${Boolean((url.searchParams.get('token') || '').trim())}`
+    );
     registerAuthFailure(ip);
     const delayMs = authSlowdownMs(ip);
     setTimeout(() => {
@@ -460,6 +606,8 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   resetFailureState(ip);
+  // eslint-disable-next-line no-console
+  console.log(`[ws-upgrade] authorized ip=${ip}`);
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit('connection', ws, req);
@@ -467,6 +615,8 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws) => {
+  // eslint-disable-next-line no-console
+  console.log('[ws] connection_open');
   if (activeConnection && activeConnection.ws.readyState === WebSocket.OPEN) {
     cleanupConnection(activeConnection, 1000, 'Replaced by a new client connection');
   }

@@ -17,6 +17,8 @@ const reconnectMaxMs = 10000;
 const STORAGE_BOOTSTRAP_TOKEN = 'bootstrap_token';
 const STORAGE_FONT_SIZE = 'terminal_font_size';
 const STORAGE_GESTURE_DEBUG = 'gesture_debug_enabled';
+const STORAGE_IOS_SCROLL_MODEL = 'ios_scroll_model';
+const STORAGE_IOS_ALT_SCREEN_MODE = 'ios_alt_screen_mode';
 const MIN_FONT_SIZE = 10;
 const MAX_FONT_SIZE = 24;
 
@@ -35,11 +37,15 @@ let inputMode = false;
 let gestureMode = 'idle';
 let touchStartX = 0;
 let touchStartY = 0;
+let touchLastY = 0;
 let touchStartTs = 0;
 let focusSuppressedUntil = 0;
 let pinchMoveListenerAttached = false;
 let lastAppliedViewportHeight = 0;
 let lastDebugViewportLogTs = 0;
+let lastOutputDebugLogTs = 0;
+let outputByteCount = 0;
+let arbiterLineRemainder = 0;
 let pinchState = {
   active: false,
   startDistance: 0,
@@ -49,9 +55,60 @@ const TAP_MOVE_THRESHOLD_PX = 8;
 const TAP_MAX_DURATION_MS = 280;
 const FOCUS_SCROLL_SUPPRESS_MS = 180;
 const FOCUS_PINCH_SUPPRESS_MS = 240;
-const DEBUG_LOG_LIMIT = 400;
+const DEBUG_LOG_LIMIT = 4000;
 const AUTH_FETCH_TIMEOUT_MS = 8000;
 const WS_CONNECT_TIMEOUT_MS = 8000;
+const IOS_SCROLL_MODEL_NATIVE = 'native';
+const IOS_SCROLL_MODEL_ARBITER = 'arbiter';
+const IOS_ALT_SCREEN_MODE_NATIVE = 'native';
+const IOS_ALT_SCREEN_MODE_IGNORE = 'ignore';
+const DEFAULT_LINE_HEIGHT_PX = 18;
+
+function isIOSDevice() {
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPad|iPod/i.test(ua)) {
+    return true;
+  }
+  // iPadOS can report itself as macOS while still exposing touch points.
+  return navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints) > 1;
+}
+
+function getIOSScrollModel() {
+  const url = new URL(window.location.href);
+  const fromQuery = (url.searchParams.get('iosScrollModel') || '').trim().toLowerCase();
+  if (fromQuery === IOS_SCROLL_MODEL_NATIVE || fromQuery === IOS_SCROLL_MODEL_ARBITER) {
+    localStorage.setItem(STORAGE_IOS_SCROLL_MODEL, fromQuery);
+    return fromQuery;
+  }
+  const fromStorage = (localStorage.getItem(STORAGE_IOS_SCROLL_MODEL) || '').trim().toLowerCase();
+  if (fromStorage === IOS_SCROLL_MODEL_NATIVE || fromStorage === IOS_SCROLL_MODEL_ARBITER) {
+    return fromStorage;
+  }
+  return IOS_SCROLL_MODEL_NATIVE;
+}
+
+const isIOS = isIOSDevice();
+const iosScrollModel = getIOSScrollModel();
+
+function isArbiterIOSScrollEnabled() {
+  return isIOS && iosScrollModel === IOS_SCROLL_MODEL_ARBITER;
+}
+
+function getIOSAltScreenMode() {
+  const url = new URL(window.location.href);
+  const fromQuery = (url.searchParams.get('iosAltScreen') || '').trim().toLowerCase();
+  if (fromQuery === IOS_ALT_SCREEN_MODE_NATIVE || fromQuery === IOS_ALT_SCREEN_MODE_IGNORE) {
+    localStorage.setItem(STORAGE_IOS_ALT_SCREEN_MODE, fromQuery);
+    return fromQuery;
+  }
+  const fromStorage = (localStorage.getItem(STORAGE_IOS_ALT_SCREEN_MODE) || '').trim().toLowerCase();
+  if (fromStorage === IOS_ALT_SCREEN_MODE_NATIVE || fromStorage === IOS_ALT_SCREEN_MODE_IGNORE) {
+    return fromStorage;
+  }
+  return IOS_ALT_SCREEN_MODE_NATIVE;
+}
+
+const iosAltScreenMode = getIOSAltScreenMode();
 
 function getSavedFontSize() {
   const saved = Number(localStorage.getItem(STORAGE_FONT_SIZE));
@@ -90,6 +147,78 @@ const webLinksAddon = new WebLinksAddon.WebLinksAddon();
 term.loadAddon(fitAddon);
 term.loadAddon(webLinksAddon);
 term.open(terminalEl);
+const termDebugId = `term-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+function getBufferSnapshot() {
+  const active = term.buffer.active;
+  const normal = term.buffer.normal;
+  return {
+    termId: termDebugId,
+    activeType: active?.type || 'unknown',
+    activeBaseY: Number(active?.baseY || 0),
+    activeViewportY: Number(active?.viewportY || 0),
+    activeLength: Number(active?.length || 0),
+    normalBaseY: Number(normal?.baseY || 0),
+    normalViewportY: Number(normal?.viewportY || 0),
+    normalLength: Number(normal?.length || 0),
+    rows: Number(term.rows || 0),
+    cols: Number(term.cols || 0),
+    scrollback: Number(term.options.scrollback || 0),
+    xtermViewportScrollTop: Number(terminalEl.querySelector('.xterm-viewport')?.scrollTop || 0),
+    termElementAttached: Boolean(term.element && term.element.isConnected)
+  };
+}
+
+function escapeSample(text, fromHead = true, maxLen = 80) {
+  const part = fromHead ? text.slice(0, maxLen) : text.slice(-maxLen);
+  return part
+    .replace(/\x1b/g, '\\x1b')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+}
+
+function summarizeChunk(text) {
+  const lfCount = (text.match(/\n/g) || []).length;
+  const crCount = (text.match(/\r/g) || []).length;
+  const escCount = (text.match(/\x1b/g) || []).length;
+  return {
+    bytes: text.length,
+    lfCount,
+    crCount,
+    escCount,
+    hasRIS: text.includes('\x1bc'),
+    hasED2: text.includes('\x1b[2J'),
+    hasED3: text.includes('\x1b[3J'),
+    hasHome: text.includes('\x1b[H'),
+    hasAltOn: text.includes('\x1b[?1049h'),
+    hasAltOff: text.includes('\x1b[?1049l'),
+    sampleHeadEscaped: escapeSample(text, true),
+    sampleTailEscaped: escapeSample(text, false)
+  };
+}
+
+function dumpState(source) {
+  gestureDebug.push('buffer', {
+    source,
+    ...getBufferSnapshot()
+  });
+}
+
+const originalClear = typeof term.clear === 'function' ? term.clear.bind(term) : null;
+if (originalClear) {
+  term.clear = (...args) => {
+    gestureDebug.push('lifecycle', { event: 'clear', termId: termDebugId, ...getBufferSnapshot() });
+    return originalClear(...args);
+  };
+}
+
+const originalReset = typeof term.reset === 'function' ? term.reset.bind(term) : null;
+if (originalReset) {
+  term.reset = (...args) => {
+    gestureDebug.push('lifecycle', { event: 'reset', termId: termDebugId, ...getBufferSnapshot() });
+    return originalReset(...args);
+  };
+}
 
 const gestureDebug = (() => {
   const url = new URL(window.location.href);
@@ -148,40 +277,137 @@ const gestureDebug = (() => {
   };
 })();
 
-term.onScroll(() => {
+gestureDebug.push('config', {
+  termId: termDebugId,
+  isIOS,
+  iosScrollModel,
+  iosAltScreenMode,
+  ...getBufferSnapshot()
+});
+
+if (isIOS && iosAltScreenMode === IOS_ALT_SCREEN_MODE_IGNORE) {
+  const suppressAltScreenMode = (params) => {
+    const modeParams = Array.isArray(params) ? params : [];
+    if (!modeParams.some((mode) => mode === 47 || mode === 1047 || mode === 1049)) {
+      return false;
+    }
+    gestureDebug.push('prevented', {
+      event: 'csi_alt_screen',
+      params: modeParams.slice(0, 6),
+      ...getBufferSnapshot()
+    });
+    return true;
+  };
+  term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, suppressAltScreenMode);
+  term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, suppressAltScreenMode);
+}
+
+term.onWriteParsed(() => {
+  gestureDebug.push('write_parsed', {
+    ...getBufferSnapshot()
+  });
+});
+
+term.onScroll((y) => {
   if (!gestureDebug.isEnabled()) return;
   const nowTs = Date.now();
   if (nowTs - lastDebugViewportLogTs < 120) return;
   lastDebugViewportLogTs = nowTs;
-  gestureDebug.push('viewport', { source: 'term_scroll', ...gestureDebug.snapshot() });
+  gestureDebug.push('viewport', { source: 'term_scroll', y, ...gestureDebug.snapshot(), ...getBufferSnapshot() });
 });
 
 function installDebugExportButton() {
   if (!gestureDebug.isEnabled()) return;
   if (document.getElementById('debug-export')) return;
 
-  const button = document.createElement('button');
-  button.id = 'debug-export';
-  button.type = 'button';
-  button.textContent = 'Debug Log';
-  button.style.position = 'fixed';
-  button.style.right = '8px';
-  button.style.bottom = '8px';
-  button.style.zIndex = '99999';
-  button.style.border = '0';
-  button.style.borderRadius = '8px';
-  button.style.padding = '7px 10px';
-  button.style.fontSize = '12px';
-  button.style.fontWeight = '700';
-  button.style.background = 'rgba(20, 104, 58, 0.92)';
-  button.style.color = '#d8f8e1';
+  const makeDebugButton = (id, text, rightPx, bg, fg) => {
+    const button = document.createElement('button');
+    button.id = id;
+    button.type = 'button';
+    button.textContent = text;
+    button.style.position = 'fixed';
+    button.style.right = `${rightPx}px`;
+    button.style.bottom = '8px';
+    button.style.zIndex = '99999';
+    button.style.border = '0';
+    button.style.borderRadius = '8px';
+    button.style.padding = '7px 10px';
+    button.style.fontSize = '12px';
+    button.style.fontWeight = '700';
+    button.style.background = bg;
+    button.style.color = fg;
+    return button;
+  };
+
+  const injectButton = makeDebugButton('debug-seq', 'Gen 300', 88, 'rgba(19, 73, 132, 0.92)', '#d8ecff');
+  injectButton.addEventListener('click', () => {
+    dumpState('gen300_before');
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setStatus('Offline', 'offline');
+      term.writeln('\r\nDebug inject skipped: socket is not open.\r\n');
+      gestureDebug.push('debug', { action: 'inject_seq300', result: 'socket_not_open' });
+      return;
+    }
+    const cmd = 'printf "__DBG_START__\\n"; seq 1 300; printf "__DBG_END__\\n"';
+    gestureDebug.push('debug', { action: 'inject_seq300', result: 'sent', cmd });
+    // Try to break out of any running full-screen program before injecting.
+    sendInput('\u0003');
+    setTimeout(() => {
+      sendInput(`${cmd}\r`);
+    }, 40);
+    setTimeout(() => dumpState('gen300_after_250ms'), 250);
+    setTimeout(() => dumpState('gen300_after_1000ms'), 1000);
+    term.writeln('\r\n[debug] injected with markers: seq 1 300\r\n');
+  });
+  document.body.appendChild(injectButton);
+
+  const button = makeDebugButton('debug-export', 'Debug Log', 8, 'rgba(20, 104, 58, 0.92)', '#d8f8e1');
 
   button.addEventListener('click', async () => {
-    const payload = JSON.stringify(gestureDebug.dump(), null, 2);
+    const logs = gestureDebug.dump();
+    const payload = JSON.stringify(logs, null, 2);
+    try {
+      const response = await fetch('/api/debug-log', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          logs,
+          meta: {
+            userAgent: navigator.userAgent,
+            isIOS,
+            iosScrollModel,
+            iosAltScreenMode,
+            href: window.location.href,
+            hasPersistedBootstrapToken: Boolean(getPersistedBootstrapToken()),
+            hasQueryTokenInUrl: Boolean(new URL(window.location.href).searchParams.get('token'))
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`debug_upload_failed_${response.status}`);
+      }
+
+      const result = await response.json();
+      const summary = result.summary || {};
+      setStatus('Debug uploaded', 'online');
+      term.writeln('\r\nDebug log uploaded.\r\n');
+      term.writeln(`Path: ${result.relativePath || result.fileName || 'unknown'}\r\n`);
+      term.writeln(
+        `Analysis: status=${summary.status || 'unknown'}, events=${summary.events || 0}, maxBaseY=${summary.maxBaseY || 0}, viewportMoves=${summary.viewportMoves || 0}, jumpsNoTerm=${summary.viewportJumpsWithoutTermMove || 0}, arbiter=${summary.arbiterScrollEvents || 0}\r\n`
+      );
+      return;
+    } catch (_err) {
+      // Fallback to local export if server-side upload failed.
+    }
+
     try {
       await navigator.clipboard.writeText(payload);
       setStatus('Debug copied', 'online');
-      term.writeln('\r\nDebug log copied to clipboard.\r\n');
+      term.writeln('\r\nDebug upload failed, log copied to clipboard.\r\n');
       return;
     } catch (_err) {
       // Fallback to file download when clipboard API is unavailable.
@@ -197,7 +423,7 @@ function installDebugExportButton() {
     link.remove();
     URL.revokeObjectURL(url);
     setStatus('Debug downloaded', 'online');
-    term.writeln('\r\nDebug log downloaded as JSON.\r\n');
+    term.writeln('\r\nDebug upload failed, log downloaded as JSON.\r\n');
   });
 
   document.body.appendChild(button);
@@ -337,6 +563,10 @@ function setStatus(text, state) {
   statusEl.textContent = text;
   statusEl.classList.remove('online', 'offline', 'connecting', 'reconnecting', 'authfailed');
   statusEl.classList.add(state);
+  gestureDebug.push('status', {
+    text,
+    state
+  });
 }
 
 function setToolbarCollapsed(nextState) {
@@ -363,8 +593,25 @@ function setInputMode(nextState) {
 }
 
 function fitAndResize() {
+  const before = getBufferSnapshot();
   fitAddon.fit();
+  const after = getBufferSnapshot();
+  gestureDebug.push('lifecycle', {
+    event: 'fit',
+    termId: termDebugId,
+    rowsBefore: before.rows,
+    colsBefore: before.cols,
+    rowsAfter: after.rows,
+    colsAfter: after.cols,
+    ...after
+  });
   if (socket && socket.readyState === WebSocket.OPEN) {
+    gestureDebug.push('lifecycle', {
+      event: 'resize_send',
+      termId: termDebugId,
+      cols: term.cols,
+      rows: term.rows
+    });
     socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   }
 }
@@ -373,6 +620,54 @@ function touchDistance(touchA, touchB) {
   const dx = touchA.clientX - touchB.clientX;
   const dy = touchA.clientY - touchB.clientY;
   return Math.hypot(dx, dy);
+}
+
+function getTerminalLineHeightPx() {
+  const firstRow = terminalEl.querySelector('.xterm-rows > div');
+  if (firstRow) {
+    const measured = firstRow.getBoundingClientRect().height;
+    if (Number.isFinite(measured) && measured > 4) {
+      return measured;
+    }
+  }
+  const byFont = (Number(term.options.fontSize) || 14) * (Number(term.options.lineHeight) || 1.24);
+  if (Number.isFinite(byFont) && byFont > 4) {
+    return byFont;
+  }
+  return DEFAULT_LINE_HEIGHT_PX;
+}
+
+function applyArbiterScrollDelta(deltaY) {
+  const lineHeightPx = getTerminalLineHeightPx();
+  const rawLines = -deltaY / lineHeightPx;
+  const linesWithRemainder = rawLines + arbiterLineRemainder;
+  const wholeLines = linesWithRemainder > 0 ? Math.floor(linesWithRemainder) : Math.ceil(linesWithRemainder);
+  arbiterLineRemainder = linesWithRemainder - wholeLines;
+  const active = term.buffer.active;
+  const maxLine = Math.max(0, active.baseY);
+  const targetLine = Math.max(0, Math.min(maxLine, active.viewportY + wholeLines));
+
+  if (wholeLines !== 0 && targetLine !== active.viewportY) {
+    if (typeof term.scrollToLine === 'function') {
+      term.scrollToLine(targetLine);
+    } else if (typeof term.scrollLines === 'function') {
+      term.scrollLines(targetLine - active.viewportY);
+    }
+  }
+
+  if (gestureDebug.isEnabled()) {
+    const nowTs = Date.now();
+    if (nowTs - lastDebugViewportLogTs > 120) {
+      lastDebugViewportLogTs = nowTs;
+      gestureDebug.push('viewport', {
+        source: 'touchmove_arbiter',
+        deltaY: Math.round(deltaY),
+        lines: wholeLines,
+        targetLine,
+        ...gestureDebug.snapshot()
+      });
+    }
+  }
 }
 
 function updateViewportHeight() {
@@ -475,8 +770,10 @@ function scheduleReconnect() {
 }
 
 function attachSocketHandlers(ws) {
+  gestureDebug.push('ws', { event: 'create', termId: termDebugId, ...getBufferSnapshot() });
   const connectTimeout = setTimeout(() => {
     if (socket !== ws || ws.readyState !== WebSocket.CONNECTING) return;
+    gestureDebug.push('ws', { event: 'connect_timeout', termId: termDebugId, ...getBufferSnapshot() });
     try {
       ws.close();
     } catch (_err) {
@@ -487,6 +784,7 @@ function attachSocketHandlers(ws) {
   const onOpen = () => {
     if (socket !== ws) return;
     clearTimeout(connectTimeout);
+    gestureDebug.push('ws', { event: 'open', termId: termDebugId, ...getBufferSnapshot() });
 
     isConnecting = false;
     connectedOnce = true;
@@ -507,7 +805,38 @@ function attachSocketHandlers(ws) {
     }
 
     if (message.type === 'output') {
-      term.write(message.data);
+      const text = String(message.data || '');
+      gestureDebug.push('ws_message', {
+        termId: termDebugId,
+        ...summarizeChunk(text),
+        ...getBufferSnapshot()
+      });
+      gestureDebug.push('term_write_before', {
+        termId: termDebugId,
+        ...summarizeChunk(text),
+        ...getBufferSnapshot()
+      });
+      term.write(text, () => {
+        gestureDebug.push('term_write_cb', {
+          termId: termDebugId,
+          ...getBufferSnapshot()
+        });
+      });
+      outputByteCount += text.length;
+      const nowTs = Date.now();
+      if (nowTs - lastOutputDebugLogTs > 300) {
+        lastOutputDebugLogTs = nowTs;
+        const newlineCount = (text.match(/\n/g) || []).length;
+        gestureDebug.push('output', {
+          bytesTotal: outputByteCount,
+          chunkBytes: text.length,
+          newlineCount,
+          hasDbgStart: text.includes('__DBG_START__'),
+          hasDbgEnd: text.includes('__DBG_END__'),
+          ...gestureDebug.snapshot(),
+          ...getBufferSnapshot()
+        });
+      }
       return;
     }
 
@@ -518,6 +847,13 @@ function attachSocketHandlers(ws) {
 
   const onClose = (event) => {
     clearTimeout(connectTimeout);
+    gestureDebug.push('ws', {
+      event: 'close',
+      code: Number(event?.code || 0),
+      reason: String(event?.reason || ''),
+      termId: termDebugId,
+      ...getBufferSnapshot()
+    });
     if (socket === ws) {
       socket = null;
     }
@@ -542,6 +878,7 @@ function attachSocketHandlers(ws) {
   const onError = () => {
     if (socket !== ws) return;
     clearTimeout(connectTimeout);
+    gestureDebug.push('ws', { event: 'error', termId: termDebugId, ...getBufferSnapshot() });
     setStatus('Offline', 'offline');
   };
 
@@ -570,6 +907,7 @@ async function connect() {
 
   try {
     const ready = await ensureAuthenticated();
+    gestureDebug.push('auth', { stage: 'ensureAuthenticated', ready });
     if (!ready) {
       isConnecting = false;
       reconnectLocked = true;
@@ -586,7 +924,18 @@ async function connect() {
   disposeSocket({ close: true });
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws`);
+  const rememberedToken = getPersistedBootstrapToken();
+  const useTokenFallback = reconnectAttempt > 0 && Boolean(rememberedToken);
+  const wsTokenQuery = useTokenFallback ? `?token=${encodeURIComponent(rememberedToken)}` : '';
+  gestureDebug.push('ws', {
+    event: 'connect_start',
+    termId: termDebugId,
+    hasRememberedToken: Boolean(rememberedToken),
+    useTokenFallback,
+    hasQueryTokenInUrl: Boolean(new URL(window.location.href).searchParams.get('token')),
+    url: `${wsProtocol}://${window.location.host}/ws${wsTokenQuery}`
+  });
+  const ws = new WebSocket(`${wsProtocol}://${window.location.host}/ws${wsTokenQuery}`);
   socket = ws;
   attachSocketHandlers(ws);
 }
@@ -847,7 +1196,9 @@ terminalWrapEl.addEventListener(
     const touch = event.touches[0];
     touchStartX = touch.clientX;
     touchStartY = touch.clientY;
+    touchLastY = touch.clientY;
     touchStartTs = Date.now();
+    arbiterLineRemainder = 0;
     gestureMode = 'tap_candidate';
     gestureDebug.push('gesture', {
       from: fromState,
@@ -900,9 +1251,13 @@ terminalWrapEl.addEventListener(
     const touch = event.touches[0];
     const dx = Math.abs(touch.clientX - touchStartX);
     const dy = Math.abs(touch.clientY - touchStartY);
+    let transitionedToScroll = false;
     if (gestureMode === 'tap_candidate' && (dx > TAP_MOVE_THRESHOLD_PX || dy > TAP_MOVE_THRESHOLD_PX)) {
       const fromState = gestureMode;
       gestureMode = 'scroll';
+      touchLastY = touch.clientY;
+      arbiterLineRemainder = 0;
+      transitionedToScroll = true;
       gestureDebug.push('gesture', {
         from: fromState,
         to: 'scroll',
@@ -911,9 +1266,18 @@ terminalWrapEl.addEventListener(
         ...gestureDebug.snapshot()
       });
       suppressFocusFor(FOCUS_SCROLL_SUPPRESS_MS);
-      return;
     }
     if (gestureMode === 'scroll') {
+      if (isArbiterIOSScrollEnabled()) {
+        let deltaY = touch.clientY - touchLastY;
+        if (transitionedToScroll && Math.abs(deltaY) < 1) {
+          // On iOS the first scroll frame can be swallowed at state transition.
+          deltaY = touch.clientY - touchStartY;
+        }
+        touchLastY = touch.clientY;
+        applyArbiterScrollDelta(deltaY);
+        event.preventDefault();
+      }
       if (gestureDebug.isEnabled()) {
         const nowTs = Date.now();
         if (nowTs - lastDebugViewportLogTs > 120) {
@@ -924,7 +1288,7 @@ terminalWrapEl.addEventListener(
       suppressFocusFor(FOCUS_SCROLL_SUPPRESS_MS);
     }
   },
-  { passive: true }
+  { passive: false }
 );
 
 terminalWrapEl.addEventListener(
@@ -939,6 +1303,7 @@ terminalWrapEl.addEventListener(
     if (gestureMode === 'scroll') {
       const fromState = gestureMode;
       gestureMode = 'idle';
+      arbiterLineRemainder = 0;
       gestureDebug.push('gesture', { from: fromState, to: 'idle', reason: 'touchend_scroll' });
       suppressFocusFor(FOCUS_SCROLL_SUPPRESS_MS);
       return;
@@ -965,6 +1330,7 @@ terminalWrapEl.addEventListener(
       exitPinchMode();
     }
     gestureMode = 'idle';
+    arbiterLineRemainder = 0;
     gestureDebug.push('gesture', { from: 'unknown', to: 'idle', reason: 'touchcancel' });
     suppressFocusFor(FOCUS_SCROLL_SUPPRESS_MS);
   },
