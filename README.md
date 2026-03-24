@@ -90,12 +90,22 @@ If token is missing/invalid:
 
 ## tmux Behavior
 
-- Default shell command on connect: `tmux new -A -s main`
+- Desktop/default profile: `tmux new -A -s main`
+- iOS profile (auto-selected): isolated tmux socket (`tmux -L mobile_web`) with:
+  - `terminal-overrides 'xterm-256color:smcup@:rmcup@'`
+  - increased `history-limit` (default `50000`)
 - Session survives reconnects and browser refreshes
 - Toolbar `Tmux` button supports:
   - `n` new session (`tmux new -A -s <name>`)
   - `a` attach session (`tmux new -A -s <name>`)
   - `k` kill session (`tmux kill-session -t <name>`)
+- Optional WS/query override for testing: `tmuxProfile=default|mobile`
+- iOS arbiter fallback: when xterm scrollback cannot move (`alternate` / `baseY=0`), client sends `tmux_scroll` and server drives tmux `copy-mode` via `send-keys -X scroll-up/down`
+- Env overrides:
+  - `TMUX_SESSION_NAME` (default: `main`)
+  - `TMUX_SOCKET_DEFAULT` (empty = default tmux socket)
+  - `TMUX_SOCKET_MOBILE` (default: `mobile_web`)
+  - `TMUX_MOBILE_HISTORY_LIMIT` (default: `50000`)
 
 ## Mobile UX Notes
 
